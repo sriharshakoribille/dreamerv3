@@ -182,6 +182,7 @@ dmc_proprio:
   run: {steps: 1.1e6, train_ratio: 1024}
 
 dmc_vision:
+  <<: *size12m
   task: dmc_walker_walk
   env.dmc.proprio: False
   run: {steps: 1.1e6, train_ratio: 256}
