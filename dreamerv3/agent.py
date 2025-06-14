@@ -34,6 +34,12 @@ class Agent(embodied.jax.Agent):
     self.obs_space = obs_space
     self.act_space = act_space
     self.config = config
+    if hasattr(config, 'clashead') and config.clas_reward_scale:
+      self.use_clas = True
+      print('Using classifier, scale: {}, coef: {}'.
+            format(config.loss_scales['clas'], config.clas_reward_scale))
+    else:
+      self.use_clas = False
 
     exclude = ('is_first', 'is_last', 'is_terminal', 'reward')
     enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
@@ -56,6 +62,8 @@ class Agent(embodied.jax.Agent):
     binary = elements.Space(bool, (), 0, 2)
     self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
     self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con')
+    if self.use_clas:
+      self.clas = embodied.jax.MLPHead(binary, **config.clashead, name='clas')
 
     d1, d2 = config.policy_dist_disc, config.policy_dist_cont
     outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
@@ -73,12 +81,16 @@ class Agent(embodied.jax.Agent):
 
     self.modules = [
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+    if self.use_clas:
+      self.modules.append(self.clas)
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
 
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
+    if not self.use_clas:
+      scales.pop('clas', None)
     scales.update({k: rec for k in dec_space})
     self.scales = scales
 
@@ -175,6 +187,64 @@ class Agent(embodied.jax.Agent):
     if self.config.contdisc:
       con *= 1 - 1 / self.config.horizon
     losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
+
+    # Classifier loss: Predicts if z_{t+1} is from prior (0) or posterior (1).
+    # Considers T-1 transitions: (s_t, a_t) -> s_{t+1} for t = 0...T-2.
+    # s_t is (h_t, z_t_post), a_t is action at time t.
+    # s_{t+1} is (h_{t+1}, z_{t+1_mixed}).
+    # - h_t, z_t_post are from dyn_entries['deter/stoch'][:, :-1] -> (h_0..h_{T-2}), (z_0_post..z_{T-2}_post)
+    # - a_t is from prevact[k][:, 1:] -> (a_0..a_{T-2})
+    # - h_{t+1} is from dyn_entries['deter'][:, 1:] -> (h_1..h_{T-1})
+    # - z_{t+1}_post is from dyn_entries['stoch'][:, 1:] -> (z_1_post..z_{T-1}_post)
+    # - z_{t+1}_prior is computed from h_{t+1}.
+    # The loss is computed for these T-1 steps. The resulting (B, T-1) loss tensor
+    # is then padded with zeros at the end to match the expected (B, T) shape.
+    if self.use_clas:
+      deter_t = sg(dyn_entries['deter'][:, :-1])
+      stoch_t_post = sg(dyn_entries['stoch'][:, :-1]) # This is z_t (posterior)
+      
+      # Get batch size and sequence length for classifier inputs
+      B_cls, T_cls = deter_t.shape[:2] # Batch size, Sequence length (T-1)
+      
+      feat_t = {'deter': deter_t, 'stoch': stoch_t_post}
+      tensor_feat_t = self.feat2tensor(feat_t)
+
+      act_t_dict = {k: sg(prevact[k][:, 1:]) for k in self.act_space}
+      tensor_act_t = nn.DictConcat(self.act_space, 2)(act_t_dict)
+      # Ensure tensor_act_t is 3D: (B_cls, T_cls, flattened_action_dim)
+      tensor_act_t = tensor_act_t.reshape((B_cls, T_cls, -1))
+
+      # Features for t+1
+      deter_tplus1 = sg(dyn_entries['deter'][:, 1:]) # This is h_{t+1}
+      stoch_tplus1_post = sg(dyn_entries['stoch'][:, 1:]) # This is z_{t+1} (posterior)
+
+      # Generate prior for z_{t+1}
+      # The prior for z_{t+1} is conditioned on h_{t+1}
+      logit_tplus1_prior = self.dyn._prior(deter_tplus1)
+      stoch_tplus1_prior = nn.cast(self.dyn._dist(logit_tplus1_prior).sample(seed=nj.seed()))
+
+      # Mix posterior and prior for z_{t+1}
+      # B_cls, T_cls are already defined from deter_t.shape[:2]
+      # Create a mask: True for prior (target 0), False for posterior (target 1)
+      select_prior_mask = jax.random.uniform(nj.seed(), shape=(B_cls, T_cls)) < 0.5
+      select_prior_mask_expanded = select_prior_mask[..., None, None] # For broadcasting with stoch
+
+      stoch_tplus1_mixed = jnp.where(
+          select_prior_mask_expanded, stoch_tplus1_prior, stoch_tplus1_post)
+      
+      feat_tplus1_mixed = {'deter': deter_tplus1, 'stoch': stoch_tplus1_mixed}
+      tensor_feat_tplus1_mixed = self.feat2tensor(feat_tplus1_mixed)
+
+      clas_input = jnp.concatenate([tensor_feat_t, tensor_act_t, tensor_feat_tplus1_mixed], axis=-1)
+      
+      # Define classifier target: 0 for prior, 1 for posterior
+      classifier_target = f32(~select_prior_mask) # ~True (prior) -> False -> 0.0; ~False (post) -> True -> 1.0
+      
+      clas_loss_unpadded = self.clas(clas_input, bdims=2).loss(sg(classifier_target))
+      # Pad the loss to (B, T) from (B, T-1)
+      losses['clas'] = jnp.concatenate([clas_loss_unpadded, jnp.zeros_like(clas_loss_unpadded[:, :1])], axis=1)
+
+
     for key, recon in recons.items():
       space, value = self.obs_space[key], obs[key]
       assert value.dtype == space.dtype, (key, space, value.dtype)
@@ -200,9 +270,48 @@ class Agent(embodied.jax.Agent):
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
     inp = self.feat2tensor(imgfeat)
+    
+    # Extrinsic reward from reward predictor
+    ext_rews = self.rew(inp, 2).pred()
+    total_rews = ext_rews
+
+    # Classifier-based intrinsic reward
+    if self.use_clas:
+      # Prepare inputs for the classifier from the imagined trajectory
+      # s_t: imgfeat[:, :-1], a_t: imgact[:, :-1], s_{t+1}: imgfeat[:, 1:]
+      
+      # Detach features to prevent gradients from reward signal into model components here
+      # Apply sg and slicing to each leaf (deter, stoch) of the imgfeat PyTree
+      feat_t_imag = jax.tree.map(lambda x: sg(x)[:, :-1], imgfeat)
+      # imgact is a dict, need to slice each action component
+      act_t_imag_dict = jax.tree.map(lambda x: sg(x)[:, :-1], imgact)
+      feat_tplus1_imag = jax.tree.map(lambda x: sg(x)[:, 1:], imgfeat)
+
+      tensor_feat_t_imag = self.feat2tensor(feat_t_imag)
+      tensor_act_t_imag = nn.DictConcat(self.act_space, 2)(act_t_imag_dict)
+      # Ensure tensor_act_t_imag is 3D: (B*K, H, flattened_action_dim)
+      tensor_act_t_imag = tensor_act_t_imag.reshape((tensor_act_t_imag.shape[0], tensor_act_t_imag.shape[1], -1))
+      tensor_feat_tplus1_imag = self.feat2tensor(feat_tplus1_imag)
+      
+      clas_input_imag = jnp.concatenate([
+          tensor_feat_t_imag, tensor_act_t_imag, tensor_feat_tplus1_imag
+      ], axis=-1)
+      
+      # Get raw logits from classifier; bdims=2 because input is (B*K, H, dim)
+      # .pred() gives the logit for class 1 (posterior-like)
+      intrinsic_rews_raw = self.clas(clas_input_imag, bdims=2).pred() # Shape (B*K, H)
+      
+      # Pad intrinsic reward to align with extrinsic: [0, r_int_0, ..., r_int_{H-1}]
+      # This means r_int_k is associated with state s_{k+1}
+      padding = jnp.zeros_like(intrinsic_rews_raw[:, :1])
+      intrinsic_rews_padded = jnp.concatenate([padding, intrinsic_rews_raw], axis=1) # Shape (B*K, H+1)
+      
+      total_rews = total_rews + self.config.clas_reward_scale * intrinsic_rews_padded
+      metrics['intrinsic_reward_clas'] = intrinsic_rews_raw.mean()
+
     los, imgloss_out, mets = imag_loss(
         imgact,
-        self.rew(inp, 2).pred(),
+        total_rews, # Use total rewards
         self.con(inp, 2).prob(1),
         self.pol(inp, 2),
         self.val(inp, 2),
@@ -233,7 +342,7 @@ class Agent(embodied.jax.Agent):
           **self.config.repl_loss)
       losses.update(los)
       metrics.update(prefix(mets, 'reploss'))
-
+    
     assert set(losses.keys()) == set(self.scales.keys()), (
         sorted(losses.keys()), sorted(self.scales.keys()))
     metrics.update({f'loss/{k}': v.mean() for k, v in losses.items()})
