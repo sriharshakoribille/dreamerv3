@@ -224,8 +224,4 @@ debug:
 
 classifier:
   agent.clas_reward_scale: 0.05
-  <<: *size12m
-  task: dmc_hopper_hop
-  env.dmc.proprio: False
-  run: {steps: 1.1e6, train_ratio: 256}
   logger.outputs: [jsonl, tensorboard]
