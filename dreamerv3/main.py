@@ -14,7 +14,7 @@ import embodied
 import numpy as np
 import portal
 import ruamel.yaml as yaml
-
+#os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.75'
 
 def main(argv=None):
   from .agent import Agent

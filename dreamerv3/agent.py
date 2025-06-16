@@ -274,6 +274,7 @@ class Agent(embodied.jax.Agent):
     # Extrinsic reward from reward predictor
     ext_rews = self.rew(inp, 2).pred()
     total_rews = ext_rews
+    metrics['extrinsic_rew'] = ext_rews.mean()
 
     # Classifier-based intrinsic reward
     if self.use_clas:
@@ -534,7 +535,7 @@ def imag_loss(
   metrics['adv'] = adv.mean()
   metrics['adv_std'] = adv.std()
   metrics['adv_mag'] = jnp.abs(adv).mean()
-  metrics['rew'] = rew.mean()
+  metrics['total_rew'] = rew.mean()
   metrics['con'] = con.mean()
   metrics['ret'] = ret_normed.mean()
   metrics['val'] = val.mean()
