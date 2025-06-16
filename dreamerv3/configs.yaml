@@ -20,7 +20,7 @@ defaults:
   errfile: False
 
   logger:
-    outputs: [jsonl, scope]
+    outputs: [jsonl, tensorboard]
     filter: 'score|length|fps|ratio|train/loss/|train/rand/'
     timer: True
     fps: 15
@@ -33,7 +33,8 @@ defaults:
     atari100k: {size: [64, 64], repeat: 4, sticky: False, gray: False, actions: needed, lives: unused, noops: 30, autostart: False, resize: pillow, clip_reward: False}
     dmlab: {size: [64, 64], repeat: 4, episodic: True, use_seed: True}
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False, length: 36000}
-    dmc: {size: [64, 64], repeat: 1, proprio: True, image: True, camera: -1, use_seed: True}
+    dmc: {size: [64, 64], repeat: 2, proprio: True, image: True, camera: -1, use_seed: True}
+    gymnasium: {size: [64, 64], repeat: 2, proprio: True, image: True, use_seed: True}
     loconav: {size: [64, 64], repeat: 1, camera: -1}
 
   replay:
@@ -181,13 +182,25 @@ dmc_proprio:
   <<: *size1m
   task: dmc_walker_walk
   env.dmc.image: False
-  run: {steps: 1.1e6, train_ratio: 1024}
+  run: {steps: 5.5e5, train_ratio: 512}
 
 dmc_vision:
   <<: *size12m
   task: dmc_walker_walk
   env.dmc.proprio: False
-  run: {steps: 1.1e6, train_ratio: 256}
+  run: {steps: 1.01e6, train_ratio: 512}
+
+gym_proprio:
+  <<: *size1m
+  task: gymnasium_HalfCheetah-v5
+  env.gymnasium.image: False
+  run: {steps: 5.5e5, train_ratio: 512}
+
+gym_vision:
+  <<: *size12m
+  task: gymnasium_HalfCheetah-v5
+  env.gymnasium.proprio: False
+  run: {steps: 1.01e6, train_ratio: 512}
 
 bsuite:
   task: bsuite_mnist/0
@@ -221,7 +234,3 @@ debug:
     .*\.hidden: 3
     .*\.blocks: 4
     .*\.depth: 2
-
-classifier:
-  agent.clas_reward_scale: 0.05
-  logger.outputs: [jsonl, tensorboard]
