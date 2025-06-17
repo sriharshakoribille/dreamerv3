@@ -30,6 +30,7 @@ def setup(
     num_processes=1,
     coordinator_address=None,
     compilation_cache=True,
+    mem_fraction=0
 ):
   platform and jax.config.update('jax_platforms', platform)
   jax.config.update('jax_disable_most_optimizations', debug)
@@ -39,6 +40,8 @@ def setup(
   os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = str(bool(prealloc)).lower()
   jax.config.update('jax_debug_nans', debug_nans)
   jax.config.update('jax_enable_compilation_cache', compilation_cache)
+  if mem_fraction:
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = str(mem_fraction)
 
   xlaflags = []
   xlaflags.append(f'--xla_gpu_autotune_level={autotune}')
