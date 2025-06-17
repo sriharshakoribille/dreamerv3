@@ -34,12 +34,13 @@ class Agent(embodied.jax.Agent):
     self.obs_space = obs_space
     self.act_space = act_space
     self.config = config
+    # Use InfoNCE if clas_reward_scale is set
     if hasattr(config, 'clashead') and config.clas_reward_scale:
-      self.use_clas = True
-      print('Using classifier, scale: {}, coef: {}'.
-            format(config.loss_scales['clas'], config.clas_reward_scale))
+      self.use_infonce = True
+      print('Using InfoNCE discriminator, scale: {}, coef: {}'.
+            format(config.loss_scales.get('infonce', 1.0), config.clas_reward_scale))
     else:
-      self.use_clas = False
+      self.use_infonce = False
 
     exclude = ('is_first', 'is_last', 'is_terminal', 'reward')
     enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
@@ -62,8 +63,13 @@ class Agent(embodied.jax.Agent):
     binary = elements.Space(bool, (), 0, 2)
     self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
     self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con')
-    if self.use_clas:
-      self.clas = embodied.jax.MLPHead(binary, **config.clashead, name='clas')
+    # InfoNCE head: outputs a scalar score for (feat_t, act_t, feat_{t+1})
+    if self.use_infonce:
+      # Use a simple MLPHead with a single output scalar.
+      # The loss type is not used for InfoNCE, only .pred() is called.
+      infonce_space = elements.Space(np.float32, (1,))
+      self.infonce = embodied.jax.MLPHead(
+          infonce_space, 'none', layers=3, units=512, name='infonce')
 
     d1, d2 = config.policy_dist_disc, config.policy_dist_cont
     outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
@@ -81,16 +87,16 @@ class Agent(embodied.jax.Agent):
 
     self.modules = [
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
-    if self.use_clas:
-      self.modules.append(self.clas)
+    if self.use_infonce:
+      self.modules.append(self.infonce)
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
 
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
-    if not self.use_clas:
-      scales.pop('clas', None)
+    if not self.use_infonce:
+      scales.pop('infonce', None)
     scales.update({k: rec for k in dec_space})
     self.scales = scales
 
@@ -188,61 +194,38 @@ class Agent(embodied.jax.Agent):
       con *= 1 - 1 / self.config.horizon
     losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
 
-    # Classifier loss: Predicts if z_{t+1} is from prior (0) or posterior (1).
-    # Considers T-1 transitions: (s_t, a_t) -> s_{t+1} for t = 0...T-2.
-    # s_t is (h_t, z_t_post), a_t is action at time t.
-    # s_{t+1} is (h_{t+1}, z_{t+1_mixed}).
-    # - h_t, z_t_post are from dyn_entries['deter/stoch'][:, :-1] -> (h_0..h_{T-2}), (z_0_post..z_{T-2}_post)
-    # - a_t is from prevact[k][:, 1:] -> (a_0..a_{T-2})
-    # - h_{t+1} is from dyn_entries['deter'][:, 1:] -> (h_1..h_{T-1})
-    # - z_{t+1}_post is from dyn_entries['stoch'][:, 1:] -> (z_1_post..z_{T-1}_post)
-    # - z_{t+1}_prior is computed from h_{t+1}.
-    # The loss is computed for these T-1 steps. The resulting (B, T-1) loss tensor
-    # is then padded with zeros at the end to match the expected (B, T) shape.
-    if self.use_clas:
+    # InfoNCE loss: contrast next posterior with negatives in batch
+    if self.use_infonce:
+      # Prepare InfoNCE inputs: [feat_t, act_t, feat_{t+1}]
       deter_t = sg(dyn_entries['deter'][:, :-1])
-      stoch_t_post = sg(dyn_entries['stoch'][:, :-1]) # This is z_t (posterior)
-      
-      # Get batch size and sequence length for classifier inputs
-      B_cls, T_cls = deter_t.shape[:2] # Batch size, Sequence length (T-1)
-      
+      stoch_t_post = sg(dyn_entries['stoch'][:, :-1])
+      B_cls, T_cls = deter_t.shape[:2]
       feat_t = {'deter': deter_t, 'stoch': stoch_t_post}
       tensor_feat_t = self.feat2tensor(feat_t)
-
       act_t_dict = {k: sg(prevact[k][:, 1:]) for k in self.act_space}
       tensor_act_t = nn.DictConcat(self.act_space, 2)(act_t_dict)
-      # Ensure tensor_act_t is 3D: (B_cls, T_cls, flattened_action_dim)
       tensor_act_t = tensor_act_t.reshape((B_cls, T_cls, -1))
-
-      # Features for t+1
-      deter_tplus1 = sg(dyn_entries['deter'][:, 1:]) # This is h_{t+1}
-      stoch_tplus1_post = sg(dyn_entries['stoch'][:, 1:]) # This is z_{t+1} (posterior)
-
-      # Generate prior for z_{t+1}
-      # The prior for z_{t+1} is conditioned on h_{t+1}
-      logit_tplus1_prior = self.dyn._prior(deter_tplus1)
-      stoch_tplus1_prior = nn.cast(self.dyn._dist(logit_tplus1_prior).sample(seed=nj.seed()))
-
-      # Mix posterior and prior for z_{t+1}
-      # B_cls, T_cls are already defined from deter_t.shape[:2]
-      # Create a mask: True for prior (target 0), False for posterior (target 1)
-      select_prior_mask = jax.random.uniform(nj.seed(), shape=(B_cls, T_cls)) < 0.5
-      select_prior_mask_expanded = select_prior_mask[..., None, None] # For broadcasting with stoch
-
-      stoch_tplus1_mixed = jnp.where(
-          select_prior_mask_expanded, stoch_tplus1_prior, stoch_tplus1_post)
-      
-      feat_tplus1_mixed = {'deter': deter_tplus1, 'stoch': stoch_tplus1_mixed}
-      tensor_feat_tplus1_mixed = self.feat2tensor(feat_tplus1_mixed)
-
-      clas_input = jnp.concatenate([tensor_feat_t, tensor_act_t, tensor_feat_tplus1_mixed], axis=-1)
-      
-      # Define classifier target: 0 for prior, 1 for posterior
-      classifier_target = f32(~select_prior_mask) # ~True (prior) -> False -> 0.0; ~False (post) -> True -> 1.0
-      
-      clas_loss_unpadded = self.clas(clas_input, bdims=2).loss(sg(classifier_target))
-      # Pad the loss to (B, T) from (B, T-1)
-      losses['clas'] = jnp.concatenate([clas_loss_unpadded, jnp.zeros_like(clas_loss_unpadded[:, :1])], axis=1)
+      deter_tplus1 = sg(dyn_entries['deter'][:, 1:])
+      stoch_tplus1_post = sg(dyn_entries['stoch'][:, 1:])
+      feat_tplus1_post = {'deter': deter_tplus1, 'stoch': stoch_tplus1_post}
+      tensor_feat_tplus1_post = self.feat2tensor(feat_tplus1_post)
+      # Flatten batch and time for easier computation
+      N = B_cls * T_cls
+      anchor = jnp.concatenate([tensor_feat_t.reshape((N, -1)), tensor_act_t.reshape((N, -1))], axis=-1)
+      cand = tensor_feat_tplus1_post.reshape((N, -1))
+      anchor_expand = jnp.expand_dims(anchor, 1)  # (N, 1, D1)
+      cand_expand = jnp.expand_dims(cand, 0)      # (1, N, D2)
+      # For each anchor (feat_t, act_t), score all candidate feat_{t+1}
+      infonce_inputs = jnp.concatenate([jnp.broadcast_to(anchor_expand, (N, N, anchor.shape[-1])),
+                                        jnp.broadcast_to(cand_expand, (N, N, cand.shape[-1]))], axis=-1)
+      infonce_inputs = infonce_inputs.reshape((N*N, -1))
+      scores = self.infonce(infonce_inputs, bdims=1).pred().reshape((N, N))
+      # InfoNCE loss: for each anchor i, positive is i==j, negatives are j!=i
+      logits = scores
+      infonce_loss = -jax.nn.log_softmax(logits, axis=1)[jnp.arange(N), jnp.arange(N)]
+      infonce_loss = infonce_loss.reshape((B_cls, T_cls))
+      # Pad to (B, T)
+      losses['infonce'] = jnp.concatenate([infonce_loss, jnp.zeros_like(infonce_loss[:, :1])], axis=1)
 
 
     for key, recon in recons.items():
@@ -276,39 +259,34 @@ class Agent(embodied.jax.Agent):
     total_rews = ext_rews
     metrics['extrinsic_rew'] = ext_rews.mean()
 
-    # Classifier-based intrinsic reward
-    if self.use_clas:
-      # Prepare inputs for the classifier from the imagined trajectory
-      # s_t: imgfeat[:, :-1], a_t: imgact[:, :-1], s_{t+1}: imgfeat[:, 1:]
-      
-      # Detach features to prevent gradients from reward signal into model components here
-      # Apply sg and slicing to each leaf (deter, stoch) of the imgfeat PyTree
+    # InfoNCE-based intrinsic reward
+    if self.use_infonce:
+      # Compute intrinsic reward as log density ratio from InfoNCE
       feat_t_imag = jax.tree.map(lambda x: sg(x)[:, :-1], imgfeat)
-      # imgact is a dict, need to slice each action component
       act_t_imag_dict = jax.tree.map(lambda x: sg(x)[:, :-1], imgact)
       feat_tplus1_imag = jax.tree.map(lambda x: sg(x)[:, 1:], imgfeat)
-
       tensor_feat_t_imag = self.feat2tensor(feat_t_imag)
       tensor_act_t_imag = nn.DictConcat(self.act_space, 2)(act_t_imag_dict)
-      # Ensure tensor_act_t_imag is 3D: (B*K, H, flattened_action_dim)
       tensor_act_t_imag = tensor_act_t_imag.reshape((tensor_act_t_imag.shape[0], tensor_act_t_imag.shape[1], -1))
       tensor_feat_tplus1_imag = self.feat2tensor(feat_tplus1_imag)
-      
-      clas_input_imag = jnp.concatenate([
-          tensor_feat_t_imag, tensor_act_t_imag, tensor_feat_tplus1_imag
-      ], axis=-1)
-      
-      # Get raw logits from classifier; bdims=2 because input is (B*K, H, dim)
-      # .pred() gives the logit for class 1 (posterior-like)
-      intrinsic_rews_raw = self.clas(clas_input_imag, bdims=2).pred() # Shape (B*K, H)
-      
-      # Pad intrinsic reward to align with extrinsic: [0, r_int_0, ..., r_int_{H-1}]
-      # This means r_int_k is associated with state s_{k+1}
+      BK, H = tensor_feat_t_imag.shape[:2]
+      N = BK * H
+      anchor = jnp.concatenate([tensor_feat_t_imag.reshape((N, -1)), tensor_act_t_imag.reshape((N, -1))], axis=-1)
+      cand = tensor_feat_tplus1_imag.reshape((N, -1))
+      anchor_expand = jnp.expand_dims(anchor, 1)
+      cand_expand = jnp.expand_dims(cand, 0)
+      infonce_inputs = jnp.concatenate([jnp.broadcast_to(anchor_expand, (N, N, anchor.shape[-1])),
+                                        jnp.broadcast_to(cand_expand, (N, N, cand.shape[-1]))], axis=-1)
+      infonce_inputs = infonce_inputs.reshape((N*N, -1))
+      scores = self.infonce(infonce_inputs, bdims=1).pred().reshape((N, N))
+      log_softmax = jax.nn.log_softmax(scores, axis=1)
+      # Use log density ratio (diagonal of log_softmax) as intrinsic reward
+      intrinsic_rews_raw = log_softmax[jnp.arange(N), jnp.arange(N)]
+      intrinsic_rews_raw = intrinsic_rews_raw.reshape((BK, H))
       padding = jnp.zeros_like(intrinsic_rews_raw[:, :1])
-      intrinsic_rews_padded = jnp.concatenate([padding, intrinsic_rews_raw], axis=1) # Shape (B*K, H+1)
-      
+      intrinsic_rews_padded = jnp.concatenate([padding, intrinsic_rews_raw], axis=1)
       total_rews = total_rews + self.config.clas_reward_scale * intrinsic_rews_padded
-      metrics['intrinsic_reward_clas'] = intrinsic_rews_raw.mean()
+      metrics['intrinsic_reward_infonce'] = intrinsic_rews_raw.mean()
 
     los, imgloss_out, mets = imag_loss(
         imgact,
