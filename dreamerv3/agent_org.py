@@ -21,44 +21,6 @@ concat = lambda xs, a: jax.tree.map(lambda *x: jnp.concatenate(x, a), *xs)
 isimage = lambda s: s.dtype == np.uint8 and len(s.shape) == 3
 
 
-class InfoNCEHead(nj.Module):
-  def __init__(self, units=512, layers=3, act='silu', norm='rms', winit='trunc_normal_in', temp=0.1, **kw):
-    self.phi = embodied.jax.nets.MLP(
-        layers=layers, units=units, act=act, norm=norm, winit=winit, name='phi')
-    self.psi = embodied.jax.nets.MLP(
-        layers=layers, units=units, act=act, norm=norm, winit=winit, name='psi')
-    self.temp = temp
-
-  def _get_logit_scale(self):
-    # This is the robust way to write the initializer. It explicitly uses the
-    # `shape` argument provided by the framework to create a tensor of that
-    # shape, filled with the desired initial value.
-    init_fn = lambda shape: jnp.full(shape, jnp.log(1 / self.temp))
-    return self.value('logit_scale', init_fn, ())
-
-  def __call__(self, anchor, candidate):
-    # anchor: (N, D), candidate: (N, D)
-    feat_anchor = self.phi(anchor)
-    feat_cand = self.psi(candidate)
-    feat_anchor = feat_anchor / jnp.maximum(1e-8, jnp.linalg.norm(feat_anchor, axis=-1, keepdims=True))
-    feat_cand = feat_cand / jnp.maximum(1e-8, jnp.linalg.norm(feat_cand, axis=-1, keepdims=True))
-    # scores: (N, N) = anchor @ candidate.T
-    scores = feat_anchor @ feat_cand.T
-    scores *= jnp.exp(self._get_logit_scale())
-    return scores
-
-  def score_pairs(self, anchor, candidate):
-    # anchor, candidate: (N, D)
-    feat_anchor = self.phi(anchor)
-    feat_cand = self.psi(candidate)
-    feat_anchor = feat_anchor / jnp.maximum(1e-8, jnp.linalg.norm(feat_anchor, axis=-1, keepdims=True))
-    feat_cand = feat_cand / jnp.maximum(1e-8, jnp.linalg.norm(feat_cand, axis=-1, keepdims=True))
-    # scores: (N,) = dot for each pair
-    scores = (feat_anchor * feat_cand).sum(-1)
-    scores *= jnp.exp(self._get_logit_scale())
-    return scores
-
-
 class Agent(embodied.jax.Agent):
 
   banner = [
@@ -72,13 +34,6 @@ class Agent(embodied.jax.Agent):
     self.obs_space = obs_space
     self.act_space = act_space
     self.config = config
-    # Use InfoNCE if clas_reward_scale is set
-    if self.config.clas_reward_scale > 0:
-      self.use_infonce = True
-      print('Using InfoNCE discriminator, scale: {}, coef: {}'.
-            format(config.loss_scales.get('infonce', 1.0), config.clas_reward_scale))
-    else:
-      self.use_infonce = False
 
     exclude = ('is_first', 'is_last', 'is_terminal', 'reward')
     enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
@@ -101,9 +56,6 @@ class Agent(embodied.jax.Agent):
     binary = elements.Space(bool, (), 0, 2)
     self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
     self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con')
-    # InfoNCE head: outputs a scalar score for (feat_t, act_t, feat_{t+1})
-    if self.use_infonce:
-      self.infonce = InfoNCEHead(**config.infoncehead, name='infonce')
 
     d1, d2 = config.policy_dist_disc, config.policy_dist_cont
     outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
@@ -121,16 +73,12 @@ class Agent(embodied.jax.Agent):
 
     self.modules = [
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
-    if self.use_infonce:
-      self.modules.append(self.infonce)
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
 
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
-    if not self.use_infonce:
-      scales.pop('infonce', None)
     scales.update({k: rec for k in dec_space})
     self.scales = scales
 
@@ -227,51 +175,6 @@ class Agent(embodied.jax.Agent):
     if self.config.contdisc:
       con *= 1 - 1 / self.config.horizon
     losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
-
-    # InfoNCE loss: contrast next posterior with negatives in batch
-    if self.use_infonce:
-      # Anchor: current state and action
-      deter_t = sg(dyn_entries['deter'][:, :-1])
-      stoch_t_post = sg(dyn_entries['stoch'][:, :-1])
-      B_cls, T_cls = deter_t.shape[:2]
-      feat_t = {'deter': deter_t, 'stoch': stoch_t_post}
-      tensor_feat_t = self.feat2tensor(feat_t)
-      act_t_dict = {k: sg(prevact[k][:, 1:]) for k in self.act_space}
-      tensor_act_t = nn.DictConcat(self.act_space, 1)(act_t_dict)
-      anchor = jnp.concatenate([tensor_feat_t, tensor_act_t], axis=-1)  # (B, T, D)
-
-      # Positive candidate: real posterior of next state
-      deter_tplus1 = sg(dyn_entries['deter'][:, 1:])
-      stoch_tplus1_post = sg(dyn_entries['stoch'][:, 1:])
-      feat_tplus1_post = {'deter': deter_tplus1, 'stoch': stoch_tplus1_post}
-      positive_candidate = self.feat2tensor(feat_tplus1_post)  # (B, T, D)
-
-      # Negatives: imagined priors for all (B, T)
-      prior_logits = self.dyn._prior(deter_tplus1)
-      prior_dist = self.dyn._dist(prior_logits)
-      stoch_tplus1_prior = prior_dist.sample(seed=nj.seed())
-      feat_tplus1_prior = {'deter': deter_tplus1, 'stoch': stoch_tplus1_prior}
-      negative_candidates = self.feat2tensor(feat_tplus1_prior)  # (B, T, D)
-
-      # Flatten batch and time for easier computation
-      N = B_cls * T_cls
-      anchor = anchor.reshape((N, -1))  # (N, D)
-      positive_candidate = positive_candidate.reshape((N, -1))  # (N, D)
-      negative_candidates = negative_candidates.reshape((N, -1))  # (N, D)
-
-      # Compute logits: (N, N) matrix, each row is anchor, columns are all negatives (including the positive)
-      logits = self.infonce(anchor, negative_candidates)  # (N, N)
-      # The positive is always at the diagonal
-      labels = jnp.arange(N, dtype=jnp.int32)
-      infonce_loss = optax.softmax_cross_entropy_with_integer_labels(
-          logits, labels)
-      infonce_loss = infonce_loss.reshape((B_cls, T_cls))
-
-      # Pad to (B, T)
-      losses['infonce'] = jnp.concatenate([
-          infonce_loss, jnp.zeros_like(infonce_loss[:, :1])], axis=1)
-
-
     for key, recon in recons.items():
       space, value = self.obs_space[key], obs[key]
       assert value.dtype == space.dtype, (key, space, value.dtype)
@@ -297,36 +200,9 @@ class Agent(embodied.jax.Agent):
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
     inp = self.feat2tensor(imgfeat)
-    
-    # Extrinsic reward from reward predictor
-    ext_rews = self.rew(inp, 2).pred()
-    total_rews = ext_rews
-    metrics['extrinsic_rew'] = ext_rews.mean()
-
-    # InfoNCE-based intrinsic reward
-    if self.use_infonce:
-      # Compute intrinsic reward as log density ratio from InfoNCE
-      feat_t_imag = jax.tree.map(lambda x: sg(x)[:, :-1], imgfeat)
-      act_t_imag_dict = jax.tree.map(lambda x: sg(x)[:, :-1], imgact)
-      feat_tplus1_imag = jax.tree.map(lambda x: sg(x)[:, 1:], imgfeat)
-      tensor_feat_t_imag = self.feat2tensor(feat_t_imag)
-      tensor_act_t_imag = nn.DictConcat(self.act_space, 1)(act_t_imag_dict)
-      tensor_feat_tplus1_imag = self.feat2tensor(feat_tplus1_imag)
-      # anchor_imag, cand_imag: (BK, H, D)
-      anchor_imag = jnp.concatenate([tensor_feat_t_imag, tensor_act_t_imag], axis=-1)
-      cand_imag = tensor_feat_tplus1_imag
-      # Get the raw scores from the discriminator for the positive pairs.
-      # This is the log density ratio (logit for the positive pair).
-      intrinsic_rews_raw = self.infonce.score_pairs(anchor_imag, cand_imag)
-      padding = jnp.zeros_like(intrinsic_rews_raw[:, :1])
-      intrinsic_rews_padded = jnp.concatenate([padding, intrinsic_rews_raw], axis=1)
-      total_rews = total_rews + self.config.clas_reward_scale * intrinsic_rews_padded
-      metrics['intrinsic_reward_infonce'] = intrinsic_rews_raw.mean()
-      metrics['infonce_temp'] = jnp.exp(self.infonce._get_logit_scale())
-
     los, imgloss_out, mets = imag_loss(
         imgact,
-        total_rews, # Use total rewards
+        self.rew(inp, 2).pred(),
         self.con(inp, 2).prob(1),
         self.pol(inp, 2),
         self.val(inp, 2),
@@ -357,7 +233,7 @@ class Agent(embodied.jax.Agent):
           **self.config.repl_loss)
       losses.update(los)
       metrics.update(prefix(mets, 'reploss'))
-    
+
     assert set(losses.keys()) == set(self.scales.keys()), (
         sorted(losses.keys()), sorted(self.scales.keys()))
     metrics.update({f'loss/{k}': v.mean() for k, v in losses.items()})
@@ -549,7 +425,7 @@ def imag_loss(
   metrics['adv'] = adv.mean()
   metrics['adv_std'] = adv.std()
   metrics['adv_mag'] = jnp.abs(adv).mean()
-  metrics['total_rew'] = rew.mean()
+  metrics['rew'] = rew.mean()
   metrics['con'] = con.mean()
   metrics['ret'] = ret_normed.mean()
   metrics['val'] = val.mean()
