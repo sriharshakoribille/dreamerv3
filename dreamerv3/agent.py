@@ -37,20 +37,23 @@ class InfoNCEHead(nj.Module):
     return self.value('logit_scale', init_fn, ())
 
   def __call__(self, anchor, candidate):
+    # anchor: (N, D), candidate: (N, D)
     feat_anchor = self.phi(anchor)
     feat_cand = self.psi(candidate)
     feat_anchor = feat_anchor / jnp.maximum(1e-8, jnp.linalg.norm(feat_anchor, axis=-1, keepdims=True))
     feat_cand = feat_cand / jnp.maximum(1e-8, jnp.linalg.norm(feat_cand, axis=-1, keepdims=True))
+    # scores: (N, N) = anchor @ candidate.T
     scores = feat_anchor @ feat_cand.T
-    # self.value returns the parameter value directly, no .read() is needed.
     scores *= jnp.exp(self._get_logit_scale())
     return scores
 
   def score_pairs(self, anchor, candidate):
+    # anchor, candidate: (N, D)
     feat_anchor = self.phi(anchor)
     feat_cand = self.psi(candidate)
     feat_anchor = feat_anchor / jnp.maximum(1e-8, jnp.linalg.norm(feat_anchor, axis=-1, keepdims=True))
     feat_cand = feat_cand / jnp.maximum(1e-8, jnp.linalg.norm(feat_cand, axis=-1, keepdims=True))
+    # scores: (N,) = dot for each pair
     scores = (feat_anchor * feat_cand).sum(-1)
     scores *= jnp.exp(self._get_logit_scale())
     return scores
@@ -227,7 +230,7 @@ class Agent(embodied.jax.Agent):
 
     # InfoNCE loss: contrast next posterior with negatives in batch
     if self.use_infonce:
-      # Prepare InfoNCE inputs: [feat_t, act_t] for anchor, [feat_{t+1}] for candidate
+      # Anchor: current state and action
       deter_t = sg(dyn_entries['deter'][:, :-1])
       stoch_t_post = sg(dyn_entries['stoch'][:, :-1])
       B_cls, T_cls = deter_t.shape[:2]
@@ -235,29 +238,39 @@ class Agent(embodied.jax.Agent):
       tensor_feat_t = self.feat2tensor(feat_t)
       act_t_dict = {k: sg(prevact[k][:, 1:]) for k in self.act_space}
       tensor_act_t = nn.DictConcat(self.act_space, 1)(act_t_dict)
-      
+      anchor = jnp.concatenate([tensor_feat_t, tensor_act_t], axis=-1)
+
+      # Positive candidate: real posterior of next state
       deter_tplus1 = sg(dyn_entries['deter'][:, 1:])
       stoch_tplus1_post = sg(dyn_entries['stoch'][:, 1:])
       feat_tplus1_post = {'deter': deter_tplus1, 'stoch': stoch_tplus1_post}
-      tensor_feat_tplus1_post = self.feat2tensor(feat_tplus1_post)
-      
+      positive_candidate = self.feat2tensor(feat_tplus1_post)
+
+      # Negative candidate: imagined posterior (prior) of next state
+      stoch_tplus1_prior = sg(dyn_entries['stoch_prior'][:, 1:])
+      feat_tplus1_prior = {'deter': deter_tplus1, 'stoch': stoch_tplus1_prior}
+      negative_candidate = self.feat2tensor(feat_tplus1_prior)
+
       # Flatten batch and time for easier computation
       N = B_cls * T_cls
-      anchor = jnp.concatenate([
-          tensor_feat_t.reshape((N, -1)),
-          tensor_act_t.reshape((N, -1))], axis=-1)
-      candidate = tensor_feat_tplus1_post.reshape((N, -1))
+      anchor = anchor.reshape((N, -1))
+      positive_candidate = positive_candidate.reshape((N, -1))
+      negative_candidate = negative_candidate.reshape((N, -1))
 
-      # Compute scores via matrix multiplication in the InfoNCE head
-      scores = self.infonce(anchor, candidate)
+      # Compute scores for positive and negative pairs
+      pos_scores = self.infonce.score_pairs(anchor, positive_candidate)
+      neg_scores = self.infonce.score_pairs(anchor, negative_candidate)
 
-      # InfoNCE loss: for each anchor i, positive is i==j, negatives are j!=i
-      labels = jnp.arange(N)
-      infonce_loss = optax.softmax_cross_entropy_with_integer_labels(scores, labels)
+      # InfoNCE loss: treat as a binary classification problem
+      logits = jnp.stack([pos_scores, neg_scores], axis=-1)
+      labels = jnp.zeros(N, dtype=jnp.int32)
+      infonce_loss = optax.softmax_cross_entropy_with_integer_labels(
+          logits, labels)
       infonce_loss = infonce_loss.reshape((B_cls, T_cls))
-      
+
       # Pad to (B, T)
-      losses['infonce'] = jnp.concatenate([infonce_loss, jnp.zeros_like(infonce_loss[:, :1])], axis=1)
+      losses['infonce'] = jnp.concatenate([
+          infonce_loss, jnp.zeros_like(infonce_loss[:, :1])], axis=1)
 
 
     for key, recon in recons.items():
@@ -297,18 +310,15 @@ class Agent(embodied.jax.Agent):
       feat_t_imag = jax.tree.map(lambda x: sg(x)[:, :-1], imgfeat)
       act_t_imag_dict = jax.tree.map(lambda x: sg(x)[:, :-1], imgact)
       feat_tplus1_imag = jax.tree.map(lambda x: sg(x)[:, 1:], imgfeat)
-      
       tensor_feat_t_imag = self.feat2tensor(feat_t_imag)
       tensor_act_t_imag = nn.DictConcat(self.act_space, 1)(act_t_imag_dict)
       tensor_feat_tplus1_imag = self.feat2tensor(feat_tplus1_imag)
-
-      # Shape (B*K, H, D_...)
+      # anchor_imag, cand_imag: (BK, H, D)
       anchor_imag = jnp.concatenate([tensor_feat_t_imag, tensor_act_t_imag], axis=-1)
       cand_imag = tensor_feat_tplus1_imag
-
       # Get the raw scores from the discriminator for the positive pairs.
+      # This is the log density ratio (logit for the positive pair).
       intrinsic_rews_raw = self.infonce.score_pairs(anchor_imag, cand_imag)
-
       padding = jnp.zeros_like(intrinsic_rews_raw[:, :1])
       intrinsic_rews_padded = jnp.concatenate([padding, intrinsic_rews_raw], axis=1)
       total_rews = total_rews + self.config.clas_reward_scale * intrinsic_rews_padded
