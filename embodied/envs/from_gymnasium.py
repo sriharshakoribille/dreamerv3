@@ -11,9 +11,9 @@ class GymnasiumEnv(embodied.Env):
   _DEFAULT_PROP_KEY = 'proprio' # Default key for non-dict observations
   _DEFAULT_ACT_KEY = 'action'         # Default key for non-dict actions
 
-  def __init__(self, env, repeat=1, size=(64, 64), proprio=True, image=True, seed=None):
+  def __init__(self, env, repeat=1, size=(64, 64), proprio=True, image=True, seed=None, **kwargs):
     if isinstance(env, str):
-      self._gymenv = gym.make(env, render_mode='rgb_array')
+      self._gymenv = gym.make(env, render_mode='rgb_array', **kwargs)
     else:
       self._gymenv = env
       # User must ensure the passed env is configured for 'rgb_array' rendering
