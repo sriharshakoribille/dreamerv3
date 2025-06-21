@@ -10,21 +10,23 @@ from . import gymnasium_wrapper
 class GymnasiumEnv(embodied.Env):
   _DEFAULT_PROP_KEY = 'proprio' # Default key for non-dict observations
   _DEFAULT_ACT_KEY = 'action'         # Default key for non-dict actions
+  _DEFAULT_PARTIAL_KEY = 'pos' # Default key for partial observations for joint states
 
   def __init__(self, env, repeat=1, size=(64, 64), proprio=True, image=True, seed=None, **kwargs):
     if isinstance(env, str):
       task_name = env
+      partial = kwargs.pop('partial', '')
       gymenv = gym.make(task_name, render_mode='rgb_array', **kwargs)
 
       # for modifying observation space in specific environments
-      # if 'HalfCheetah' in task_name:
-      #   # For HalfCheetah, the observation is composed of positions and velocities.
-      #   # This wrapper selects only the position components.
-      #   obs_dim = gymenv.observation_space.shape[0]
-      #   # For HalfCheetah-v4, obs is (17,), pos are first 8. obs_dim // 2 works.
-      #   pos_indices = list(range(obs_dim // 2))
-      #   gymenv = gymnasium_wrapper.SelectObsWrapper(
-      #       gymenv, obs_indices_to_keep=pos_indices)
+      if partial == self._DEFAULT_PARTIAL_KEY:
+        # For HalfCheetah and hopper, the observation is composed of positions and velocities.
+        # This wrapper selects only the position components.
+        obs_dim = gymenv.observation_space.shape[0]
+        # For HalfCheetah-v4, obs is (17,), pos are first 8. obs_dim // 2 works.
+        pos_indices = list(range(obs_dim // 2))
+        gymenv = gymnasium_wrapper.SelectObsWrapper(
+            gymenv, obs_indices_to_keep=pos_indices)
       self._gymenv = gymenv
     else:
       self._gymenv = env

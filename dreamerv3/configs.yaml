@@ -34,7 +34,7 @@ defaults:
     dmlab: {size: [64, 64], repeat: 4, episodic: True, use_seed: True}
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False, length: 36000}
     dmc: {size: [64, 64], repeat: 2, proprio: True, image: True, camera: -1, use_seed: True}
-    gymnasium: {size: [64, 64], repeat: 2, proprio: True, image: True, use_seed: True}
+    gymnasium: {size: [64, 64], repeat: 2, proprio: True, image: True, use_seed: True, partial: ''}
     loconav: {size: [64, 64], repeat: 1, camera: -1}
 
   replay:
