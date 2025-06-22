@@ -60,10 +60,10 @@ def train_eval(
         episode.add(key + '/sum', value, agg='sum')
     if tran['is_last']:
       result = episode.result()
-      logger.add({
-          'score': result.pop('score'),
-          'length': result.pop('length'),
-      }, prefix='episode')
+      # logger.add({
+      #     'score': result['score'],
+      #     'length': result['length'],
+      # }, prefix='episode')
       rew = result.pop('rewards')
       if len(rew) > 1:
         result['reward_rate'] = (np.abs(rew[1:] - rew[:-1]) >= 0.01).mean()
@@ -132,7 +132,9 @@ def train_eval(
       print('Evaluation')
       driver_eval.reset(agent.init_policy)
       driver_eval(eval_policy, episodes=args.eval_eps)
-      logger.add(eval_epstats.result(), prefix='epstats')
+      eval_results = eval_epstats.result()
+      logger.add(eval_results, prefix='epstats')
+      logger.add(eval_results, prefix='eval')
       if len(replay_train):
         carry_report, mets = reportfn(carry_report, stream_report)
         logger.add(mets, prefix='report')
@@ -144,7 +146,9 @@ def train_eval(
 
     if should_log(step):
       logger.add(agg.result())
-      logger.add(train_epstats.result(), prefix='epstats')
+      train_results = train_epstats.result()
+      logger.add(train_results, prefix='epstats')
+      logger.add(train_results, prefix='train')
       logger.add(replay_train.stats(), prefix='replay')
       logger.add(usage.stats(), prefix='usage')
       logger.add({'fps/policy': policy_fps.result()})
