@@ -11,12 +11,15 @@ class GymnasiumEnv(embodied.Env):
   _DEFAULT_PROP_KEY = 'proprio' # Default key for non-dict observations
   _DEFAULT_ACT_KEY = 'action'         # Default key for non-dict actions
   _DEFAULT_PARTIAL_KEY = 'pos' # Default key for partial observations for joint states
+  _DEFAULT_CONTROL_COST = {'HalfCheetah-v5': 0.1, 'Hopper-v5': 1e-3}
 
   def __init__(self, env, repeat=1, size=(64, 64), proprio=True, image=True, seed=None, **kwargs):
     if isinstance(env, str):
       task_name = env
       partial = kwargs.pop('partial', '')
-      gymenv = gym.make(task_name, render_mode='rgb_array', **kwargs)
+      ctrl_mult = kwargs['ctrl_mult']
+      gymenv = gym.make(task_name, render_mode='rgb_array', 
+                        ctrl_cost_weight=self._DEFAULT_CONTROL_COST[task_name]*ctrl_mult)
 
       # for modifying observation space in specific environments
       if partial == self._DEFAULT_PARTIAL_KEY:
