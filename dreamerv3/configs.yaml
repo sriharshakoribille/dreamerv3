@@ -183,25 +183,25 @@ dmc_proprio:
   <<: *size1m
   task: dmc_walker_walk
   env.dmc.image: False
-  run: {steps: 2.7e5, train_ratio: 512, report_every: 150}
+  run: {steps: 2.6e5, train_ratio: 512, report_every: 150}
 
 dmc_vision:
   <<: *size12m
   task: dmc_walker_walk
   env.dmc.proprio: False
-  run: {steps: 5.2e5, train_ratio: 512}
+  run: {steps: 5.1e5, train_ratio: 512}
 
 gym_proprio:
   <<: *size1m
   task: gymnasium_HalfCheetah-v5
   env.gymnasium.image: False
-  run: {steps: 2.7e5, train_ratio: 512, report_every: 150}
+  run: {steps: 2.6e5, train_ratio: 512, report_every: 150}
 
 gym_vision:
   <<: *size12m
   task: gymnasium_HalfCheetah-v5
   env.gymnasium.proprio: False
-  run: {steps: 5.2e5, train_ratio: 512}
+  run: {steps: 5.1e5, train_ratio: 512}
 
 bsuite:
   task: bsuite_mnist/0
