@@ -51,7 +51,7 @@ defaults:
     duration: 0
     train_ratio: 32.0
     log_every: 120
-    report_every: 150
+    report_every: 300
     save_every: 900
     envs: 16
     eval_envs: 4
@@ -183,7 +183,7 @@ dmc_proprio:
   <<: *size1m
   task: dmc_walker_walk
   env.dmc.image: False
-  run: {steps: 2.7e5, train_ratio: 512}
+  run: {steps: 2.7e5, train_ratio: 512, report_every: 150}
 
 dmc_vision:
   <<: *size12m
@@ -195,7 +195,7 @@ gym_proprio:
   <<: *size1m
   task: gymnasium_HalfCheetah-v5
   env.gymnasium.image: False
-  run: {steps: 2.7e5, train_ratio: 512}
+  run: {steps: 2.7e5, train_ratio: 512, report_every: 150}
 
 gym_vision:
   <<: *size12m
