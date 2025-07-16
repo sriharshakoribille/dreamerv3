@@ -205,6 +205,7 @@ def make_replay(config, folder, mode='train'):
         priority=selectors.Prioritized(**config.replay.prio),
         recency=selectors.Recency(recency),
     ), config.replay.fracs)
+    kwargs['seed'] = config.seed
 
   return embodied.replay.Replay(**kwargs)
 
