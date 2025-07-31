@@ -14,7 +14,7 @@ import embodied
 import numpy as np
 import portal
 import ruamel.yaml as yaml
-
+#os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.75'
 
 def main(argv=None):
   from .agent import Agent
@@ -159,7 +159,7 @@ def make_logger(config):
     if output == 'jsonl':
       outputs.append(elements.logger.JSONLOutput(logdir, 'metrics.jsonl'))
       outputs.append(elements.logger.JSONLOutput(
-          logdir, 'scores.jsonl', 'episode/score'))
+          logdir, 'scores_all.jsonl', r'/score$'))
     elif output == 'tensorboard':
       outputs.append(elements.logger.TensorBoardOutput(
           logdir, config.logger.fps))
@@ -205,6 +205,7 @@ def make_replay(config, folder, mode='train'):
         priority=selectors.Prioritized(**config.replay.prio),
         recency=selectors.Recency(recency),
     ), config.replay.fracs)
+    kwargs['seed'] = config.seed
 
   return embodied.replay.Replay(**kwargs)
 
@@ -216,6 +217,7 @@ def make_env(config, index, **overrides):
     import memory_maze  # noqa
   ctor = {
       'dummy': 'embodied.envs.dummy:Dummy',
+      'gymnasium': 'embodied.envs.from_gymnasium:GymnasiumEnv',
       'gym': 'embodied.envs.from_gym:FromGym',
       'dm': 'embodied.envs.from_dmenv:FromDM',
       'crafter': 'embodied.envs.crafter:Crafter',
