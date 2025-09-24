@@ -34,7 +34,8 @@ defaults:
     dmlab: {size: [64, 64], repeat: 4, episodic: True, use_seed: True}
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False, length: 36000}
     dmc: {size: [64, 64], repeat: 2, proprio: True, image: True, camera: -1, use_seed: True, partial: ''}
-    gymnasium: {size: [64, 64], repeat: 2, proprio: True, image: True, use_seed: True, partial: '', ctrl_mult: 1.0}
+    # gymnasium: {size: [64, 64], repeat: 2, proprio: True, image: True, use_seed: True, partial: '', ctrl_mult: 1.0}
+    gymnasium: {size: [64, 64], repeat: 1, proprio: True, image: True, use_seed: True, partial: ''}
     loconav: {size: [64, 64], repeat: 1, camera: -1}
 
   replay:
@@ -99,7 +100,7 @@ defaults:
       simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, outscale: 1.0, winit: trunc_normal_in, outer: False, kernel: 5, bspace: 8, strided: False}
     rewhead: {layers: 1, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
     conhead: {layers: 1, units: 1024, act: silu, norm: rms, output: binary, outscale: 1.0, winit: trunc_normal_in}
-    clashead: {layers: 3, units: 1024, act: silu, norm: rms, output: binary, outscale: 1.0, winit: trunc_normal_in}
+    clashead: {layers: 2, units: 1024, act: silu, norm: rms, output: binary, outscale: 1.0, winit: trunc_normal_in}
     policy: {layers: 3, units: 1024, act: silu, norm: rms, minstd: 0.1, maxstd: 1.0, outscale: 0.01, unimix: 0.01, winit: trunc_normal_in}
     value: {layers: 3, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
     policy_dist_disc: categorical

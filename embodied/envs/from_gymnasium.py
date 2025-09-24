@@ -3,6 +3,7 @@ import functools
 import elements
 import embodied
 import gymnasium as gym
+import minigrid
 import numpy as np
 import cv2
 from . import gymnasium_wrapper
@@ -17,10 +18,11 @@ class GymnasiumEnv(embodied.Env):
     if isinstance(env, str):
       task_name = env
       partial = kwargs.pop('partial', '')
-      ctrl_mult = kwargs['ctrl_mult']
-      gymenv = gym.make(task_name, render_mode='rgb_array', 
-                        ctrl_cost_weight=self._DEFAULT_CONTROL_COST[task_name]*ctrl_mult)
+      # ctrl_mult = kwargs['ctrl_mult']
+      # gymenv = gym.make(task_name, render_mode='rgb_array', 
+      #                   ctrl_cost_weight=self._DEFAULT_CONTROL_COST[task_name]*ctrl_mult)
 
+      gymenv = gym.make(task_name, render_mode='rgb_array')
       # for modifying observation space in specific environments
       if partial == self._DEFAULT_PARTIAL_KEY:
         # For HalfCheetah and hopper, the observation is composed of positions and velocities.
